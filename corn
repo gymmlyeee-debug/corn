@@ -1,0 +1,192 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import kornia.filters as kf 
+import numpy as np
+import time
+
+
+
+
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_c, out_c, k=3, s=1, p=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_c, out_c, k, s, p, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.SiLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+class HFPM(nn.Module):
+ 
+
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        self.branch1 = ConvBNReLU(in_c, out_c // 2, k=3, p=1)
+        self.branch2 = nn.Sequential(
+            nn.AvgPool2d(2, 2),
+            ConvBNReLU(in_c, out_c // 2, k=3, p=1),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        )
+        self.fusion = ConvBNReLU(out_c, out_c, k=1, p=0)
+
+    def forward(self, x):
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        return self.fusion(torch.cat([x1, x2], dim=1))
+
+
+class MCAE(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        self.d1 = ConvBNReLU(in_c, out_c // 4, k=3, p=1, s=1)  
+        self.d2 = nn.Sequential(nn.Conv2d(in_c, out_c // 4, 3, padding=2, dilation=2), nn.BatchNorm2d(out_c // 4),
+                                nn.SiLU())
+        self.d3 = nn.Sequential(nn.Conv2d(in_c, out_c // 4, 3, padding=4, dilation=4), nn.BatchNorm2d(out_c // 4),
+                                nn.SiLU())
+        self.pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(in_c, out_c // 4, 1))
+
+    def forward(self, x):
+        size = x.shape[2:]
+        x1 = self.d1(x)
+        x2 = self.d2(x)
+        x3 = self.d3(x)
+        x4 = F.interpolate(self.pool(x), size=size, mode='bilinear', align_corners=True)
+        return torch.cat([x1, x2, x3, x4], dim=1)
+
+
+class DPAE(nn.Module):
+    def __init__(self, in_c):
+        super().__init__()
+        self.channel_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_c, in_c // 16, 1),
+            nn.ReLU(),
+            nn.Conv2d(in_c // 16, in_c, 1),
+            nn.Sigmoid()
+        )
+        self.spatial_att = nn.Sequential(
+            nn.Conv2d(in_c, 1, 7, padding=3),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        xc = x * self.channel_att(x)
+        xs = x * self.spatial_att(x)
+        return xc + xs
+
+
+class SRD(nn.Module):
+
+    def __init__(self, in_c, skip_c, out_c):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_c, in_c, kernel_size=4, stride=2, padding=1)
+        self.fusion = ConvBNReLU(in_c + skip_c, out_c, k=3, p=1)
+        self.boundary_weight = nn.Parameter(torch.tensor(0.2)) 
+
+    def forward(self, x, skip):
+
+        x_up = self.up(x)
+
+        with torch.no_grad():
+            b_map = kf.laplacian(skip, kernel_size=3)
+            b_map = torch.sigmoid(torch.mean(b_map, dim=1, keepdim=True))
+
+
+        x_cat = torch.cat([x_up, skip], dim=1)
+        f_out = self.fusion(x_cat)
+
+        return f_out + self.boundary_weight * f_out * b_map
+
+
+
+class CornWSNet(nn.Module):
+    def __init__(self, num_classes=4):  
+        super().__init__()
+        print("初始化 CornWS (Ver 1.0 Fixed)...")
+
+        self.stem = ConvBNReLU(3, 64)
+        self.hfpm = HFPM(64, 64)  
+        self.down1 = nn.MaxPool2d(2)
+
+        self.layer1 = ConvBNReLU(64, 128)
+        self.mcae = MCAE(128, 128)  
+        self.down2 = nn.MaxPool2d(2)
+
+        self.layer2 = ConvBNReLU(128, 256)
+        self.dpae = DPAE(256)  
+
+        self.srd1 = SRD(256, 128, 128)  
+        self.srd2 = SRD(128, 64, 64)
+
+        self.classifier = nn.Conv2d(64, num_classes, kernel_size=1)
+
+    def forward(self, x):
+
+        x0 = self.stem(x)
+        x0 = self.hfpm(x0)  
+
+        x1 = self.down1(x0)
+        x1 = self.layer1(x1)
+        x1 = self.mcae(x1) 
+
+        x2 = self.down2(x1)
+        x2 = self.layer2(x2)
+        x2 = self.dpae(x2) 
+
+
+        d1 = self.srd1(x2, x1)
+        d2 = self.srd2(d1, x0)
+
+        out = self.classifier(d2)
+        return out
+
+
+def run_validation_demo():
+    print("\n" + "=" * 50)
+
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CornWSNet(num_classes=4).to(device)
+
+
+    dummy_input = torch.randn(4, 3, 256, 256).to(device)
+    dummy_target = torch.randint(0, 4, (4, 256, 256)).to(device)
+
+    print(f"输入图像尺寸: {dummy_input.shape}")
+    print(f"目标标签尺寸: {dummy_target.shape}")
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    print("\n[阶段一] 开始前向推理测试 (Inference Latency Test)...")
+    model.eval()
+    start_time = time.time()
+    with torch.no_grad():
+        output = model(dummy_input)
+    end_time = time.time()
+
+    print(f"推理完成。输出尺寸: {output.shape}")  
+    print(f"单批次耗时: {(end_time - start_time) * 1000:.2f} ms")
+
+    print("\n[阶段二] 模拟梯度反向传播 (Framework Stability Test)...")
+    model.train()
+    for epoch in range(5):  
+        optimizer.zero_grad()
+        output = model(dummy_input)
+        loss = criterion(output, dummy_target)
+        loss.backward()
+        optimizer.step()
+        print(f"Epoch [{epoch + 1}/5], Loss: {loss.item():.4f}")
+
+    print("\n" + "=" * 50)
+    print("=" * 50)
+
+
+if __name__ == '__main__':
+    run_validation_demo()
